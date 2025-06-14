@@ -6022,7 +6022,7 @@ pub const ShellIntegrationFeatures = packed struct {
 ///
 ///   * `off` - No SSH integration, use standard ssh command
 ///
-///   * `term_only` - Only fix TERM compatibility (xterm-ghostty -> xterm-256color)
+///   * `term-only` - Only fix TERM compatibility (xterm-ghostty -> xterm-256color)
 ///
 ///   * `basic` - TERM fix + environment variable propagation
 ///
@@ -6031,7 +6031,7 @@ pub const ShellIntegrationFeatures = packed struct {
 /// The default value is `off`.
 pub const SSHIntegration = enum {
     off,
-    term_only,
+    @"term-only",
     basic,
     full,
 
