@@ -6041,14 +6041,6 @@ pub const SSHIntegration = enum {
     @"term-only",
     basic,
     full,
-
-    pub fn jsonStringify(
-        self: SSHIntegration,
-        options: std.json.StringifyOptions,
-        writer: anytype,
-    ) !void {
-        try std.json.stringify(@tagName(self), options, writer);
-    }
 };
 
 /// OSC 4, 10, 11, and 12 default color reporting format.
