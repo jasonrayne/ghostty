@@ -24,7 +24,7 @@ pub const DefaultPathError = Allocator.Error || error{
     XdgLookupFailed,
 };
 
-pub const Error = error{ CacheIsLocked, HostnameIsInvalid };
+pub const Error = error{ CacheIsLocked, HostnameIsInvalid, InvalidCachePath, TerminfoUnavailable };
 
 /// Returns the default path for the cache for a given program.
 ///
@@ -68,6 +68,25 @@ pub fn add(
 ) !AddResult {
     if (!isValidCacheKey(hostname)) return error.HostnameIsInvalid;
 
+    // Generate current terminfo hash
+    const terminfo_hash = generateTerminfoHash(alloc) catch |err| {
+        std.log.warn("Failed to generate terminfo hash: {}", .{err});
+        // Fall back to version string if hash generation fails
+        const terminfo_copy = try alloc.dupe(u8, "xterm-ghostty");
+        return addWithHash(self, alloc, hostname, terminfo_copy);
+    };
+    defer alloc.free(terminfo_hash);
+
+    return addWithHash(self, alloc, hostname, terminfo_hash);
+}
+
+// Internal helper that does the actual adding
+fn addWithHash(
+    self: DiskCache,
+    alloc: Allocator,
+    hostname: []const u8,
+    terminfo_hash: []const u8,
+) !AddResult {
     // Create cache directory if needed
     if (std.fs.path.dirname(self.path)) |dir| {
         std.fs.cwd().makePath(dir) catch |err| switch (err) {
@@ -109,18 +128,28 @@ pub fn add(
     const result: AddResult = if (!gop.found_existing) add: {
         const hostname_copy = try alloc.dupe(u8, hostname);
         errdefer alloc.free(hostname_copy);
-        const terminfo_copy = try alloc.dupe(u8, "xterm-ghostty");
-        errdefer alloc.free(terminfo_copy);
+        const hash_copy = try alloc.dupe(u8, terminfo_hash);
+        errdefer alloc.free(hash_copy);
 
         gop.key_ptr.* = hostname_copy;
         gop.value_ptr.* = .{
             .hostname = gop.key_ptr.*,
             .timestamp = std.time.timestamp(),
-            .terminfo_version = terminfo_copy,
+            .terminfo_version = hash_copy,
         };
         break :add .added;
     } else update: {
-        // Update timestamp for existing entry
+        // Check if hash changed
+        const hash_changed = !std.mem.eql(u8, gop.value_ptr.terminfo_version, terminfo_hash);
+
+        if (hash_changed) {
+            // Update hash if it changed
+            alloc.free(gop.value_ptr.terminfo_version);
+            const hash_copy = try alloc.dupe(u8, terminfo_hash);
+            gop.value_ptr.terminfo_version = hash_copy;
+        }
+
+        // Always update timestamp
         gop.value_ptr.timestamp = std.time.timestamp();
         break :update .updated;
     };
@@ -169,8 +198,8 @@ pub fn remove(
     try self.writeCacheFile(alloc, entries, null);
 }
 
-/// Check if a hostname exists in the cache.
-/// Returns false if the cache file doesn't exist.
+/// Check if a hostname exists in the cache AND has matching terminfo hash.
+/// Returns false if the cache file doesn't exist or hash doesn't match.
 pub fn contains(
     self: DiskCache,
     alloc: Allocator,
@@ -192,7 +221,17 @@ pub fn contains(
     var entries = try readEntries(alloc, file);
     defer deinitEntries(alloc, &entries);
 
-    return entries.contains(hostname);
+    const entry = entries.get(hostname) orelse return false;
+
+    // Generate current terminfo hash
+    const current_hash = generateTerminfoHash(alloc) catch {
+        // If we can't generate hash, fall back to simple existence check
+        return true;
+    };
+    defer alloc.free(current_hash);
+
+    // Verify hash matches
+    return std.mem.eql(u8, entry.terminfo_version, current_hash);
 }
 
 fn fixupPermissions(file: std.fs.File) (std.fs.File.StatError || std.fs.File.ChmodError)!void {
@@ -213,28 +252,71 @@ fn writeCacheFile(
     entries: std.StringHashMap(Entry),
     expire_days: ?u32,
 ) !void {
-    var td: TempDir = try .init();
-    defer td.deinit();
+    // Get directory containing cache file
+    const cache_dir = std.fs.path.dirname(self.path) orelse return error.InvalidCachePath;
 
-    const tmp_file = try td.dir.createFile("ssh-cache", .{ .mode = 0o600 });
+    // Create cache directory if needed
+    std.fs.cwd().makePath(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Open cache directory
+    var dir = try std.fs.openDirAbsolute(cache_dir, .{});
+    defer dir.close();
+
+    // Create temp file in SAME directory as cache (not /tmp)
+    const tmp_name = try std.fmt.allocPrint(alloc, ".ssh-cache.tmp.{d}", .{std.time.timestamp()});
+    defer alloc.free(tmp_name);
+
+    const tmp_file = try dir.createFile(tmp_name, .{ .mode = 0o600 });
     defer tmp_file.close();
-    const tmp_path = try td.dir.realpathAlloc(alloc, "ssh-cache");
-    defer alloc.free(tmp_path);
 
+    // Write entries
     var buf: [1024]u8 = undefined;
     var writer = tmp_file.writer(&buf);
     var iter = entries.iterator();
     while (iter.next()) |kv| {
-        // Only write non-expired entries
         if (kv.value_ptr.isExpired(expire_days)) continue;
         try kv.value_ptr.format(&writer.interface);
     }
-
-    // Don't forget to flush!!
     try writer.interface.flush();
 
-    // Atomic replace
+    // Get absolute path for rename
+    const tmp_path = try dir.realpathAlloc(alloc, tmp_name);
+    defer alloc.free(tmp_path);
+
+    // Atomic rename (now on same filesystem)
     try std.fs.renameAbsolute(tmp_path, self.path);
+}
+
+/// Generate SHA256 hash of current xterm-ghostty terminfo.
+/// Returns hex-encoded hash string that must be freed by caller.
+/// Falls back to simple version string if infocmp is unavailable.
+fn generateTerminfoHash(alloc: Allocator) ![]u8 {
+    // Run infocmp to get terminfo data
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &[_][]const u8{ "infocmp", "-x", "xterm-ghostty" },
+    }) catch |err| {
+        std.log.warn("Failed to run infocmp: {}", .{err});
+        return error.TerminfoUnavailable;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        return error.TerminfoUnavailable;
+    }
+
+    // Hash the terminfo output
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(result.stdout);
+    var hash: [32]u8 = undefined;
+    hasher.final(&hash);
+
+    // Convert to hex string
+    return try std.fmt.allocPrint(alloc, "{x}", .{hash});
 }
 
 /// List all entries in the cache.
